@@ -70,6 +70,7 @@ langchain-community==0.3.27
 langchain-core==0.3.72
 langchain-google-genai==2.1.8
 langchain-groq==0.3.6
+langchain-huggingface==0.0.3
 langchain-text-splitters==0.3.9
 langdetect==1.0.9
 langsmith==0.4.8
