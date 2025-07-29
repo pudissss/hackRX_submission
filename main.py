@@ -1,15 +1,16 @@
-import asyncio
 import os
+import io
+import requests
 import tempfile
+import asyncio
 from typing import List
 
-import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceInferenceAPIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -23,13 +24,13 @@ load_dotenv()
 # --- Configuration & Security ---
 app = FastAPI(
     title="Bajaj RX Hackathon 6.0 Submission",
-    description="An API that processes a document from a URL and answers questions about it.",
+    description="An API that processes a document from a URL and answers questions about it."
 )
 security = HTTPBearer()
 EXPECTED_TOKEN = "9e0d05561dcac37f88a694cb07f2b08f55b6487433f612155d30b883cbeb6008"
 
-
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Dependency function to verify the Bearer token."""
     if credentials.scheme != "Bearer" or credentials.credentials != EXPECTED_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -37,26 +38,25 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         )
     return credentials
 
-
 # --- Pydantic Schemas for API ---
 class RunRequest(BaseModel):
     documents: HttpUrl
     questions: List[str]
 
-
 class RunResponse(BaseModel):
     answers: List[str]
 
-
 # --- Core RAG Components (loaded once) ---
-# Using a fast and effective embedding model
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True},
+# Using Hugging Face's Inference API to offload memory usage
+embeddings = HuggingFaceInferenceAPIEmbeddings(
+    api_key=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
+
 llm = ChatGroq(
-    temperature=0, model_name="llama3-8b-8192", api_key=os.getenv("GROQ_API_KEY")
+    temperature=0,
+    model_name="llama3-8b-8192",
+    api_key=os.getenv("GROQ_API_KEY")
 )
 
 # A more direct prompt for concise, user-friendly answers
@@ -80,11 +80,8 @@ prompt = ChatPromptTemplate.from_template(
     """
 )
 
-
 # --- API Endpoint ---
-@app.post(
-    "/hackrx/run", response_model=RunResponse, dependencies=[Depends(verify_token)]
-)
+@app.post("/hackrx/run", response_model=RunResponse, dependencies=[Depends(verify_token)])
 async def run_submission(request: RunRequest):
     tmp_file_path = None
     try:
@@ -94,15 +91,12 @@ async def run_submission(request: RunRequest):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(response.content)
             tmp_file_path = tmp_file.name
-
+        
         loader = PyPDFLoader(file_path=tmp_file_path)
         docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500, chunk_overlap=200
-        )
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         splits = text_splitter.split_documents(docs)
         vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        # Retrieving a balanced number of documents for speed and context
         retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
         # 2. Define the RAG chain for a single question
@@ -112,32 +106,18 @@ async def run_submission(request: RunRequest):
             | llm
             | StrOutputParser()
         )
-
-        # 3. OPTIMIZATION: Run tasks in smaller concurrent batches to respect rate limits
-        answers = []
-        batch_size = 3  # Process 3 requests at a time
-        for i in range(0, len(request.questions), batch_size):
-            # Get the current batch of questions
-            batch_questions = request.questions[i : i + batch_size]
-            # Create async tasks for the current batch
-            tasks = [rag_chain.ainvoke(question) for question in batch_questions]
-            # Run the batch and get the results
-            batch_answers = await asyncio.gather(*tasks)
-            # Add the results to our final list
-            answers.extend(batch_answers)
-
+        
+        # 3. Run all tasks concurrently for maximum speed
+        tasks = [rag_chain.ainvoke(question) for question in request.questions]
+        answers = await asyncio.gather(*tasks)
+            
         return RunResponse(answers=answers)
 
     except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to download document: {e}",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to download document: {e}")
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An internal error occurred: {e}",
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred: {e}")
     finally:
+        # Clean up the temporary file after the request is done
         if tmp_file_path and os.path.exists(tmp_file_path):
             os.unlink(tmp_file_path)
