@@ -1,0 +1,12 @@
+{
+  // Set Ruff as the default formatter for Python files
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true
+  },
+  // Enable linting with Ruff
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "explicit",
+    "source.fixAll": "explicit"
+  }
+}
