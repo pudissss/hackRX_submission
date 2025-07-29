@@ -10,7 +10,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceInferenceAPIEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings # UPDATED IMPORT
 from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -48,9 +48,10 @@ class RunResponse(BaseModel):
 
 # --- Core RAG Components (loaded once) ---
 # Using Hugging Face's Inference API to offload memory usage
-embeddings = HuggingFaceInferenceAPIEmbeddings(
+# UPDATED: Corrected the class name
+embeddings = HuggingFaceEndpointEmbeddings(
     api_key=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+    model="sentence-transformers/all-MiniLM-L6-v2"
 )
 
 llm = ChatGroq(
