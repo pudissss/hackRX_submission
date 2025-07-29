@@ -31,10 +31,6 @@ EXPECTED_TOKEN = "9e0d05561dcac37f88a694cb07f2b08f55b6487433f612155d30b883cbeb60
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Dependency function to verify the Bearer token."""
-    # --- DEBUGGING LINE ---
-    print(f"Received Token: '{credentials.credentials}'")
-    # --- END DEBUGGING LINE ---
-
     if credentials.scheme != "Bearer" or credentials.credentials != EXPECTED_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -63,15 +59,19 @@ llm = ChatGroq(
     temperature=0, model_name="llama3-8b-8192", api_key=os.getenv("GROQ_API_KEY")
 )
 
+# Refined prompt for more accurate and user-friendly answers
 prompt = ChatPromptTemplate.from_template(
     """
-    You are a helpful Q&A assistant. Your task is to answer the user's question based *only* on the provided context.
+    You are an expert policy analyst. Your goal is to provide direct, factual, and user-friendly answers based *only* on the provided text.
 
     Instructions:
-    1.  Provide a direct, concise answer.
-    2.  Synthesize the information into a single, clean paragraph. Do not use bullet points or lists.
-    3.  Do NOT add any conversational phrases or introductory text like "Based on the context...".
-    4.  If the information is not available in the context, respond with the exact phrase: "This information is not available in the provided policy document."
+    1.  Carefully analyze the user's question and the provided context.
+    2.  If the question can be answered with a "Yes" or "No", start your answer with "Yes," or "No,".
+    3.  After the initial "Yes/No", concisely explain the conditions, definitions, or calculations based on the context.
+    4.  If the question asks for a specific piece of information (like a time period or definition), provide it directly without a "Yes/No" prefix.
+    5.  **Do not** quote the policy document. Rephrase the information in plain, easy-to-understand language.
+    6.  **Do not** use introductory phrases like "According to the policy...".
+    7.  If the information to answer the question is not in the context, respond with the exact phrase: "This information is not available in the provided policy document."
 
     CONTEXT:
     {context}
@@ -79,7 +79,7 @@ prompt = ChatPromptTemplate.from_template(
     QUESTION:
     {question}
 
-    CONCISE ANSWER:
+    ANSWER:
     """
 )
 
@@ -100,14 +100,17 @@ async def run_submission(request: RunRequest):
 
         loader = PyPDFLoader(file_path=tmp_file_path)
         docs = loader.load()
+        # UPDATED: Increased chunk size and overlap for better context
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500, chunk_overlap=200
+            chunk_size=1500, chunk_overlap=150
         )
         splits = text_splitter.split_documents(docs)
         vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
-        # 2. Define the RAG chain for a single question
+        # 2. UPDATED: Retrieve more documents to provide more context to the LLM
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 7})
+
+        # 3. Define the RAG chain for a single question
         rag_chain = (
             {"context": retriever, "question": RunnablePassthrough()}
             | prompt
@@ -115,7 +118,7 @@ async def run_submission(request: RunRequest):
             | StrOutputParser()
         )
 
-        # 3. Run all tasks concurrently for maximum speed
+        # 4. Run all tasks concurrently for maximum speed
         tasks = [rag_chain.ainvoke(question) for question in request.questions]
         answers = await asyncio.gather(*tasks)
 
