@@ -9,3 +9,5 @@ pypdf
 chromadb
 python-dotenv
 requests
+torch
+rank_bm25
