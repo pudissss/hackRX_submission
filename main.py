@@ -9,13 +9,14 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from pydantic import BaseModel, HttpUrl
+from rank_bm25 import BM25Okapi
 
 # Load environment variables from .env file
 load_dotenv()
@@ -49,26 +50,28 @@ class RunResponse(BaseModel):
 
 
 # --- Core RAG Components (loaded once) ---
-# Using a fast and effective embedding model
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True},
+# OPTIMIZATION: Using Hugging Face's fast Inference API to offload embedding creation.
+embeddings = HuggingFaceEndpointEmbeddings(
+    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+    model="sentence-transformers/all-MiniLM-L6-v2",
 )
+
 llm = ChatGroq(
     temperature=0, model_name="llama3-8b-8192", api_key=os.getenv("GROQ_API_KEY")
 )
 
-# A more direct prompt for concise, user-friendly answers
 prompt = ChatPromptTemplate.from_template(
     """
-    You are a helpful Q&A assistant. Your task is to answer the user's question based *only* on the provided context.
+    You are an expert policy analyst. Your goal is to provide direct, factual, and user-friendly answers based *only* on the provided text.
 
     Instructions:
-    1.  Provide a direct, concise answer.
-    2.  Synthesize the information into a single, clean paragraph. Do not use bullet points or lists.
-    3.  Do NOT add any conversational phrases or introductory text like "Based on the context...".
-    4.  If the information is not available in the context, respond with the exact phrase: "This information is not available in the provided policy document."
+    1.  Carefully analyze the user's question and the provided context.
+    2.  If the question can be answered with a "Yes" or "No", start your answer with "Yes," or "No,".
+    3.  After the initial "Yes/No", concisely explain the conditions, definitions, or calculations based on the context.
+    4.  If the question asks for a specific piece of information, provide it directly without a "Yes/No" prefix.
+    5.  **Do not** quote the policy document. Rephrase the information in plain, easy-to-understand language.
+    6.  **Do not** use introductory phrases like "According to the policy...".
+    7.  If the information to answer the question is not in the context, respond with the exact phrase: "This information is not available in the provided policy document."
 
     CONTEXT:
     {context}
@@ -76,7 +79,7 @@ prompt = ChatPromptTemplate.from_template(
     QUESTION:
     {question}
 
-    CONCISE ANSWER:
+    ANSWER:
     """
 )
 
@@ -98,33 +101,52 @@ async def run_submission(request: RunRequest):
         loader = PyPDFLoader(file_path=tmp_file_path)
         docs = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500, chunk_overlap=200
+            chunk_size=1000, chunk_overlap=100
         )
         splits = text_splitter.split_documents(docs)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        # Retrieving a balanced number of documents for speed and context
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
-        # 2. Define the RAG chain for a single question
+        # 2. Create both Semantic and Keyword retrievers
+        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+        semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+        tokenized_corpus = [doc.page_content.split(" ") for doc in splits]
+        bm25 = BM25Okapi(tokenized_corpus)
+
+        def keyword_retriever(query):
+            tokenized_query = query.split(" ")
+            bm25_scores = bm25.get_scores(tokenized_query)
+            top_n_indices = sorted(
+                range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+            )[:3]
+            return [splits[i] for i in top_n_indices]
+
+        # 3. Define the RAG chain for a single question using Hybrid Search
+        async def hybrid_retrieve(question):
+            semantic_docs = await semantic_retriever.ainvoke(question)
+            keyword_docs = keyword_retriever(question)
+
+            # Combine and de-duplicate results
+            combined_docs = {
+                doc.page_content: doc for doc in semantic_docs + keyword_docs
+            }
+            return list(combined_docs.values())
+
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+
         rag_chain = (
-            {"context": retriever, "question": RunnablePassthrough()}
+            {
+                "context": RunnablePassthrough() | hybrid_retrieve | format_docs,
+                "question": RunnablePassthrough(),
+            }
             | prompt
             | llm
             | StrOutputParser()
         )
 
-        # 3. OPTIMIZATION: Run tasks in smaller concurrent batches to respect rate limits
-        answers = []
-        batch_size = 3  # Process 3 requests at a time
-        for i in range(0, len(request.questions), batch_size):
-            # Get the current batch of questions
-            batch_questions = request.questions[i : i + batch_size]
-            # Create async tasks for the current batch
-            tasks = [rag_chain.ainvoke(question) for question in batch_questions]
-            # Run the batch and get the results
-            batch_answers = await asyncio.gather(*tasks)
-            # Add the results to our final list
-            answers.extend(batch_answers)
+        # 4. Run all tasks concurrently
+        tasks = [rag_chain.ainvoke(question) for question in request.questions]
+        answers = await asyncio.gather(*tasks)
 
         return RunResponse(answers=answers)
 
