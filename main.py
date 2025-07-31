@@ -13,7 +13,8 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings  # UPDATED IMPORT
+from langchain_openai import ChatOpenAI  # Using this wrapper for OpenRouter
 from pydantic import BaseModel, HttpUrl
 
 # Load environment variables from .env file
@@ -49,16 +50,17 @@ class RunResponse(BaseModel):
 
 
 # --- Core RAG Components (loaded once) ---
-# Using Google's embedding model to match the LLM
-embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/embedding-001", google_api_key=os.getenv("GOOGLE_API_KEY")
+# UPDATED: Using a local Hugging Face model for embeddings. NO HF API KEY NEEDED.
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={"device": "cpu"}
 )
 
-# UPDATED: Using Gemini 2.0 Flash-Lite for the highest request limit
-llm = ChatGoogleGenerativeAI(
+# Using a free model via OpenRouter to avoid rate limits
+llm = ChatOpenAI(
     temperature=0,
-    model="gemini-2.0-flash-lite",
-    google_api_key=os.getenv("GOOGLE_API_KEY"),
+    model="mistralai/mistral-7b-instruct:free",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    base_url="https://openrouter.ai/api/v1",
 )
 
 # A more direct prompt for concise, user-friendly answers
