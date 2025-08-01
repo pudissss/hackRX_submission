@@ -57,7 +57,9 @@ embeddings = HuggingFaceEndpointEmbeddings(
 )
 
 llm = ChatGroq(
-    temperature=0, model_name="gemma2-9b-it", api_key=os.getenv("GROQ_API_KEY")
+    temperature=0,
+    model_name="llama3-70b-8192",  # UPDATED to the more powerful Llama 3 70B model
+    api_key=os.getenv("GROQ_API_KEY"),
 )
 
 prompt = ChatPromptTemplate.from_template(
@@ -139,9 +141,7 @@ async def run_submission(request: RunRequest):
             | prompt
             | llm
             | StrOutputParser()
-            | (
-                lambda x: x.strip()
-            )  # ADDED: Clean up whitespace and newlines from the final output
+            | (lambda x: x.strip())
         )
 
         # 4. Run all tasks concurrently
