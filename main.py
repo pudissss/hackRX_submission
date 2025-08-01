@@ -1,6 +1,7 @@
 import asyncio
 import os
 import tempfile
+from operator import itemgetter
 from typing import List
 
 import requests
@@ -12,10 +13,11 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_huggingface import HuggingFaceEmbeddings  # UPDATED IMPORT
-from langchain_openai import ChatOpenAI  # Using this wrapper for OpenRouter
+from langchain_core.runnables import RunnableLambda
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from pydantic import BaseModel, HttpUrl
+from rank_bm25 import BM25Okapi
 
 # Load environment variables from .env file
 load_dotenv()
@@ -30,7 +32,6 @@ EXPECTED_TOKEN = "9e0d05561dcac37f88a694cb07f2b08f55b6487433f612155d30b883cbeb60
 
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Dependency function to verify the Bearer token."""
     if credentials.scheme != "Bearer" or credentials.credentials != EXPECTED_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -50,20 +51,15 @@ class RunResponse(BaseModel):
 
 
 # --- Core RAG Components (loaded once) ---
-# UPDATED: Using a local Hugging Face model for embeddings. NO HF API KEY NEEDED.
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={"device": "cpu"}
+embeddings = HuggingFaceEndpointEmbeddings(
+    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+    model="sentence-transformers/all-MiniLM-L6-v2",
 )
 
-# Using a free model via OpenRouter to avoid rate limits
-llm = ChatOpenAI(
-    temperature=0,
-    model="mistralai/mistral-7b-instruct:free",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    base_url="https://openrouter.ai/api/v1",
+llm = ChatGroq(
+    temperature=0, model_name="gemma2-9b-it", api_key=os.getenv("GROQ_API_KEY")
 )
 
-# A more direct prompt for concise, user-friendly answers
 prompt = ChatPromptTemplate.from_template(
     """
     You are a helpful Q&A assistant. Your task is to answer the user's question based *only* on the provided context.
@@ -102,22 +98,54 @@ async def run_submission(request: RunRequest):
         loader = PyPDFLoader(file_path=tmp_file_path)
         docs = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500, chunk_overlap=200
+            chunk_size=1000, chunk_overlap=100
         )
         splits = text_splitter.split_documents(docs)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
-        # 2. Define the RAG chain for a single question
+        # 2. Create both Semantic and Keyword retrievers
+        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+        semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+        tokenized_corpus = [doc.page_content.split(" ") for doc in splits]
+        bm25 = BM25Okapi(tokenized_corpus)
+
+        def keyword_retriever(query):
+            tokenized_query = query.split(" ")
+            bm25_scores = bm25.get_scores(tokenized_query)
+            top_n_indices = sorted(
+                range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+            )[:3]
+            return [splits[i] for i in top_n_indices]
+
+        # 3. Define the RAG chain for a single question using Hybrid Search
+        async def hybrid_retrieve(question):
+            semantic_docs = await semantic_retriever.ainvoke(question)
+            keyword_docs = keyword_retriever(question)
+            combined_docs = {
+                doc.page_content: doc for doc in semantic_docs + keyword_docs
+            }
+            return list(combined_docs.values())
+
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+
         rag_chain = (
-            {"context": retriever, "question": RunnablePassthrough()}
+            {
+                "context": itemgetter("question")
+                | RunnableLambda(hybrid_retrieve)
+                | RunnableLambda(format_docs),
+                "question": itemgetter("question"),
+            }
             | prompt
             | llm
             | StrOutputParser()
+            | (
+                lambda x: x.strip()
+            )  # ADDED: Clean up whitespace and newlines from the final output
         )
 
-        # 3. Run all tasks concurrently for maximum speed
-        tasks = [rag_chain.ainvoke(question) for question in request.questions]
+        # 4. Run all tasks concurrently
+        tasks = [rag_chain.ainvoke({"question": q}) for q in request.questions]
         answers = await asyncio.gather(*tasks)
 
         return RunResponse(answers=answers)
@@ -133,6 +161,5 @@ async def run_submission(request: RunRequest):
             detail=f"An internal error occurred: {e}",
         )
     finally:
-        # Clean up the temporary file after the request is done
         if tmp_file_path and os.path.exists(tmp_file_path):
             os.unlink(tmp_file_path)
