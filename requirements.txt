@@ -1,13 +1,11 @@
 fastapi
 uvicorn
 langchain
-langchain-openai
+langchain-groq
 langchain-community
 langchain-huggingface
-sentence-transformers
 pypdf
 chromadb
 python-dotenv
 requests
-torch
-tiktoken
+rank_bm25
