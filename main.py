@@ -7,9 +7,11 @@ import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from langchain.retrievers import ParentDocumentRetriever
+from langchain.storage import InMemoryStore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
@@ -50,6 +52,7 @@ class RunResponse(BaseModel):
 
 
 # --- Core RAG Components (loaded once) ---
+# Using Hugging Face's Inference API to offload memory usage
 embeddings = HuggingFaceEndpointEmbeddings(
     huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
     model="sentence-transformers/all-MiniLM-L6-v2",
@@ -59,9 +62,11 @@ llm = ChatGroq(
     temperature=0, model_name="llama3-8b-8192", api_key=os.getenv("GROQ_API_KEY")
 )
 
+# A more direct prompt for concise, user-friendly answers
 prompt = ChatPromptTemplate.from_template(
     """
     You are an expert policy analyst. Your goal is to provide direct, factual, and user-friendly answers based *only* on the provided text.
+
     Instructions:
     1.  Carefully analyze the user's question and the provided context.
     2.  If the question can be answered with a "Yes" or "No", start your answer with "Yes," or "No,".
@@ -89,6 +94,7 @@ prompt = ChatPromptTemplate.from_template(
 async def run_submission(request: RunRequest):
     tmp_file_path = None
     try:
+        # 1. Download and process the document
         response = requests.get(str(request.documents))
         response.raise_for_status()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
@@ -97,20 +103,43 @@ async def run_submission(request: RunRequest):
 
         loader = PyPDFLoader(file_path=tmp_file_path)
         docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, chunk_overlap=100
+
+        # 2. UPDATED: Set up the Parent Document Retriever for high accuracy
+        # This splitter creates the "parent" chunks (full paragraphs)
+        parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1200, chunk_overlap=100
         )
-        splits = text_splitter.split_documents(docs)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 7})
+        # This splitter creates smaller, more precise chunks for searching
+        child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=300, chunk_overlap=50
+        )
+
+        vectorstore = Chroma(
+            collection_name="split_parents", embedding_function=embeddings
+        )
+        store = InMemoryStore()
+
+        retriever = ParentDocumentRetriever(
+            vectorstore=vectorstore,
+            docstore=store,
+            child_splitter=child_splitter,
+            parent_splitter=parent_splitter,
+        )
+        # Important: You must add the documents to the retriever
+        retriever.add_documents(docs, ids=None)
+
+        # 3. Define the RAG chain for a single question
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
 
         rag_chain = (
-            {"context": retriever, "question": RunnablePassthrough()}
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
             | prompt
             | llm
             | StrOutputParser()
         )
 
+        # 4. Run all tasks concurrently for maximum speed
         tasks = [rag_chain.ainvoke(question) for question in request.questions]
         answers = await asyncio.gather(*tasks)
 
@@ -127,5 +156,6 @@ async def run_submission(request: RunRequest):
             detail=f"An internal error occurred: {e}",
         )
     finally:
+        # Clean up the temporary file after the request is done
         if tmp_file_path and os.path.exists(tmp_file_path):
             os.unlink(tmp_file_path)
